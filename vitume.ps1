@@ -1,10 +1,3 @@
-# Check if the script is already running as a job
-if (-not $MyInvocation.PSCommandPath) {
-    # Start the script as a background job
-    Start-Job -FilePath $MyInvocation.MyCommand.Path
-    exit
-}
-
 # Set execution policy for current process only
 if ((Get-ExecutionPolicy -Scope Process) -ne 'Bypass') {
     try {
